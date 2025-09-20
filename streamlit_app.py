@@ -8,7 +8,6 @@ import plotly.graph_objects as go
 # ---------------------------
 def deg2rad(d): return np.deg2rad(d)
 def rad2deg(r): return np.rad2deg(r)
-def sgn(x): return 1.0 if x >= 0 else -1.0
 
 def rot_x(a):
     t=deg2rad(a); c,s=np.cos(t),np.sin(t)
@@ -26,8 +25,7 @@ def normalize(v):
     n=np.linalg.norm(v); 
     return v if n==0 else v/n
 
-# Apparent torsion formula (body-fixed order R = Ry(b) Rx(a) Rz(g))
-# φ_app = atan2( sin g * cos b − cos g * sin a * sin b , cos g * cos a )
+# Apparent torsion from true (body-fixed: R=Ry(b) Rx(a) Rz(g))
 def apparent_from_true(a, b, g):
     ca,sa = np.cos(deg2rad(a)), np.sin(deg2rad(a))
     cb,sb = np.cos(deg2rad(b)), np.sin(deg2rad(b))
@@ -36,23 +34,18 @@ def apparent_from_true(a, b, g):
     den = cg*ca
     return rad2deg(np.arctan2(num, den))
 
-# Inversion for true torsion from apparent:
-# tan φ = (sin g * cos b − cos g * sin a * sin b) / (cos g * cos a)
-# => tan g = (tan φ * cos a + sin a * sin b) / cos b
+# Inversion: true torsion from apparent
 def true_from_apparent_phi(phi_app, a, b):
     ca,sa = np.cos(deg2rad(a)), np.sin(deg2rad(a))
     cb,sb = np.cos(deg2rad(b)), np.sin(deg2rad(b))
     A = np.tan(deg2rad(phi_app))
     tg = (A*ca + sa*sb) / (cb + 1e-12)
     g = rad2deg(np.arctan(tg))
-    # Normalize to (-180,180]
     if g <= -180: g += 360
     if g > 180: g -= 360
     return g
 
-# Recover actual 3D angulations (about X and Y) from projected measurements
-# AP (ZX): b = theta_ap
-# Lateral (ZY): a = atan( tan(theta_lat) * cos b )
+# Recover 3D angulations about X (sagittal) and Y (coronal) from projected XR angles
 def recover_axial_rotations_from_projections(theta_lat, theta_ap):
     b = theta_ap  # coronal (about Y)
     a = rad2deg(np.arctan(np.tan(deg2rad(theta_lat)) * np.cos(deg2rad(b))))
@@ -88,29 +81,41 @@ def planes_through_origin(limit=1.2, opacity=0.07):
     s_zy=go.Surface(x=np.zeros_like(X),y=X,z=Y,opacity=opacity,showscale=False,name='ZY (x=0)')
     return [s_xy,s_zx,s_zy]
 
-def plane_xy_bottom(limit=1.2, opacity=0.10):
+def plane_faces(limit=1.2, which=('xy_bottom','zx_front','zy_side'), opacity=0.10):
     rng=np.linspace(-limit, limit, 2)
     X,Y=np.meshgrid(rng, rng)
-    return go.Surface(x=X,y=Y,z=np.full_like(X,-limit),opacity=opacity,showscale=False,name='XY bottom')
+    planes=[]
+    if 'xy_bottom' in which:
+        planes.append(go.Surface(x=X,y=Y,z=np.full_like(X,-limit),
+                                 opacity=opacity,showscale=False,name='XY bottom'))
+    if 'zx_front' in which:
+        planes.append(go.Surface(x=X,y=np.full_like(X, limit),z=Y,
+                                 opacity=opacity,showscale=False,name='ZX front'))
+    if 'zy_side' in which:
+        planes.append(go.Surface(x=np.full_like(X, limit),y=X,z=Y,
+                                 opacity=opacity,showscale=False,name='ZY side'))
+    return planes
 
-def projected_line_xy_bottom(start, vec, color='rgba(0,0,0,0.65)', width=6, limit=1.2):
+def projected_line_to_face(start, vec, face='xy_bottom', color='rgba(0,0,0,0.65)', width=6, limit=1.2):
     s=np.array(start); v=np.array(vec); tip=s+v
-    eps=1e-3; z_plane=-limit+eps
-    sP=np.array([s[0],s[1],z_plane]); tP=np.array([tip[0],tip[1],z_plane])
+    eps=1e-3
+    if face=='xy_bottom':
+        sP=np.array([s[0],s[1],-limit+eps]); tP=np.array([tip[0],tip[1],-limit+eps])
+    elif face=='zx_front':
+        sP=np.array([s[0],limit-eps,s[2]]); tP=np.array([tip[0],limit-eps,tip[2]])
+    elif face=='zy_side':
+        sP=np.array([limit-eps,s[1],s[2]]); tP=np.array([limit-eps,tip[1],tip[2]])
+    else:
+        raise ValueError("face must be 'xy_bottom','zx_front','zy_side'")
     return go.Scatter3d(x=[sP[0],tP[0]], y=[sP[1],tP[1]], z=[sP[2],tP[2]],
                         mode='lines+markers', line=dict(color=color, width=width),
-                        marker=dict(size=3, color=color), name='proj', showlegend=False)
+                        marker=dict(size=3, color=color), name=f'proj→{face}', showlegend=False)
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
 st.set_page_config(page_title="True Torsion from Projected Inputs (XR + CT)", layout="wide")
 st.title("True Torsion from Projected AP/Lateral Angulation and Apparent Axial Torsion")
-
-st.markdown(
-    "Enter **AP (coronal) angulation** and **lateral (sagittal) angulation** from radiographs (2D, projected), "
-    "and **apparent torsion** from axial CT. The app de‑angulates and computes the **true torsion**."
-)
 
 c1,c2,c3 = st.columns(3)
 with c1:
@@ -121,10 +126,17 @@ with c3:
     phi_app    = st.number_input("Apparent torsion on axial CT – XY projection [deg]",
                                  value=0.0, step=1.0, format="%.2f")
 
-# Recover actual 3D rotations about X (sagittal) & Y (coronal) from projections
-alpha_sag, beta_cor = recover_axial_rotations_from_projections(theta_lat, theta_ap)
+pc1, pc2, pc3 = st.columns(3)
+with pc1:
+    proj_xy = st.checkbox("Project onto XY bottom", value=True)
+with pc2:
+    proj_zx = st.checkbox("Project onto ZX front", value=False)
+with pc3:
+    proj_zy = st.checkbox("Project onto ZY side", value=False)
 
-# Compute true torsion from apparent torsion and recovered α, β
+offset = st.slider("Anterior arrow offset from joint (units)", 0.0, 1.5, 0.0, 0.05)
+
+alpha_sag, beta_cor = recover_axial_rotations_from_projections(theta_lat, theta_ap)
 gamma_true = true_from_apparent_phi(phi_app, alpha_sag, beta_cor)
 
 st.subheader("Results")
@@ -133,12 +145,10 @@ colA.metric("Recovered sagittal angulation α (about X)", f"{alpha_sag:.2f}°")
 colB.metric("Recovered coronal angulation β (about Y)", f"{beta_cor:.2f}°")
 colC.metric("TRUE torsion after de‑angulation (about Z)", f"{gamma_true:.2f}°")
 
-# Self-consistency check
 phi_check = apparent_from_true(alpha_sag, beta_cor, gamma_true)
 st.caption(f"Consistency check: predicted apparent torsion from (α,β,γ_true) = {phi_check:.2f}° "
            f"(should match input {phi_app:.2f}° within rounding).")
 
-# ------------- Visualization -------------
 R = rot_y(beta_cor) @ rot_x(alpha_sag) @ rot_z(gamma_true)
 
 origin=np.zeros(3)
@@ -147,21 +157,41 @@ Z_dist = normalize(R @ np.array([0,0,-1]))
 A_prox=np.array([0,1,0])
 A_dist = normalize(R @ np.array([0,1,0]))
 
+uZp = normalize(Z_prox); uZd = normalize(Z_dist)
+base_prox = origin + offset * uZp
+base_dist = origin + offset * uZd
+
 limit=1.2
 traces=[]
 traces += axes_traces(limit=limit)
 traces += planes_through_origin(limit=limit, opacity=0.07)
-traces.append(plane_xy_bottom(limit=limit, opacity=0.10))
+
+faces_to_draw = []
+if proj_xy: faces_to_draw.append('xy_bottom')
+if proj_zx: faces_to_draw.append('zx_front')
+if proj_zy: faces_to_draw.append('zy_side')
+traces += plane_faces(limit=limit, which=faces_to_draw, opacity=0.10)
 
 traces += arrow_trace(origin, Z_prox, 'royalblue',  'Z_prox')
 traces += arrow_trace(origin, Z_dist, 'darkorange', 'Z_dist')
-traces += arrow_trace(origin, A_prox, 'seagreen',   'A_prox')
-traces += arrow_trace(origin, A_dist, 'crimson',    'A_dist')
+traces += arrow_trace(base_prox, A_prox, 'seagreen',   'A_prox')
+traces += arrow_trace(base_dist, A_dist, 'crimson',    'A_dist')
 
-traces += [projected_line_xy_bottom(origin,    Z_prox, color='rgba(65,105,225,0.6)', limit=limit)]
-traces += [projected_line_xy_bottom(origin,    Z_dist, color='rgba(255,140,0,0.6)', limit=limit)]
-traces += [projected_line_xy_bottom(origin,    A_prox, color='rgba(46,139,87,0.6)', limit=limit)]
-traces += [projected_line_xy_bottom(origin,    A_dist, color='rgba(220,20,60,0.6)', limit=limit)]
+if proj_xy:
+    traces += [projected_line_to_face(origin,    Z_prox, face='xy_bottom', color='rgba(65,105,225,0.6)', limit=limit)]
+    traces += [projected_line_to_face(origin,    Z_dist, face='xy_bottom', color='rgba(255,140,0,0.6)', limit=limit)]
+    traces += [projected_line_to_face(base_prox, A_prox, face='xy_bottom', color='rgba(46,139,87,0.6)', limit=limit)]
+    traces += [projected_line_to_face(base_dist, A_dist, face='xy_bottom', color='rgba(220,20,60,0.6)', limit=limit)]
+if proj_zx:
+    traces += [projected_line_to_face(origin,    Z_prox, face='zx_front', color='rgba(65,105,225,0.6)', limit=limit)]
+    traces += [projected_line_to_face(origin,    Z_dist, face='zx_front', color='rgba(255,140,0,0.6)', limit=limit)]
+    traces += [projected_line_to_face(base_prox, A_prox, face='zx_front', color='rgba(46,139,87,0.6)', limit=limit)]
+    traces += [projected_line_to_face(base_dist, A_dist, face='zx_front', color='rgba(220,20,60,0.6)', limit=limit)]
+if proj_zy:
+    traces += [projected_line_to_face(origin,    Z_prox, face='zy_side', color='rgba(65,105,225,0.6)', limit=limit)]
+    traces += [projected_line_to_face(origin,    Z_dist, face='zy_side', color='rgba(255,140,0,0.6)', limit=limit)]
+    traces += [projected_line_to_face(base_prox, A_prox, face='zy_side', color='rgba(46,139,87,0.6)', limit=limit)]
+    traces += [projected_line_to_face(base_dist, A_dist, face='zy_side', color='rgba(220,20,60,0.6)', limit=limit)]
 
 fig3d=go.Figure(data=traces)
 fig3d.update_layout(scene=dict(
@@ -173,6 +203,4 @@ fig3d.update_layout(scene=dict(
 
 st.plotly_chart(fig3d, use_container_width=True)
 
-st.info("Assumes body‑fixed order R = R_y(β) R_x(α) R_z(γ). Signs of AP/lateral angles follow your XR conventions. "
-        "If your measurement convention differs (e.g., varus vs valgus positive), we can add sign toggles.")
-
+st.info("Recovered sagittal angulation α is the actual 3D rotation about X that best explains the measured lateral (ZY) projected angulation after accounting for coronal angulation β; specifically α = atan( tan θ_lat · cos β ).")
